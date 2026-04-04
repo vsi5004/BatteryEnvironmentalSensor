@@ -169,9 +169,9 @@ envsensor/
 
 ### SCD41 — Warmup Shot Pattern
 
-The SCD41 always returns CO₂ = 0 on its **first** single-shot measurement after a power cycle. This is avoided with a two-shot pattern:
+The SCD41 datasheet recommends discarding the first single-shot measurement after a cold start. This is implemented with a two-shot pattern:
 
-1. `initSensors()`: wait 35ms after power-on (datasheet max: 30ms), then fire a **warmup shot**. This shot is discarded per Sensirion's recommendation.
+1. `initSensors()`: wait 35ms after power-on (datasheet max: 30ms), then fire a **warmup shot**. This shot is discarded per the Sensirion datasheet recommendation.
 2. Other init (battery gauge etc.) runs during the ~3.8s warmup window.
 3. `triggerMeasurement()`: waits for the warmup shot to complete, discards it, fires the **real shot**.
 4. WiFi connects during the ~5s real shot window.
@@ -271,7 +271,7 @@ All entities are grouped under a single HA device block. To force re-discovery, 
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| CO₂ always 0 | SCD41 first shot after power-on always returns 0 | Warmup shot pattern in `initSensors()` |
+| CO₂ first reading unreliable | SCD41 datasheet recommends discarding first single-shot on cold start | Warmup shot pattern in `initSensors()` |
 | Battery reads 0V | MAX17048 ADC not ready at first read | `quickStart()` + 125ms delay in `initBattery()` |
 | MQTT discovery drops last entity | TCP send buffer not flushed before WiFi off | `_mqtt.disconnect()` + 100ms before `WiFi.disconnect()` |
 | Mosquitto receives null retained messages | HA clears retained topics when a device is deleted | Don't delete HA device; power-cycle ESP32 to republish |
