@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"damage\\\\|destroy\\\\|concern\\\\|ghost\\\\|retain\\\\|residual\" /c/Users/isirc/Documents/Arduino/libraries/GxEPD2/src --include=*.h --include=*.cpp)",
+      "Bash(grep -r \"setPartialWindow\\\\|setFullWindow\\\\|partial.*update\\\\|ghost\" /c/Users/isirc/Documents/Arduino/libraries/GxEPD2/src/*.h)",
+      "Bash(grep -n \"Serial\\\\.\" *.cpp *.ino)",
+      "Bash(xargs grep:*)",
+      "Bash(ls -la /c/Users/isirc/Documents/Arduino/libraries/GxEPD2/src/*.h)",
+      "Bash(ls -1 /c/Users/isirc/Documents/Arduino/libraries/GxEPD2/src/*.h)",
+      "Bash(xargs basename:*)"
+    ]
+  }
+}
