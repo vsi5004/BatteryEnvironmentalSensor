@@ -9,7 +9,14 @@
 // =============================================================================
 // Display object — pins from config.h, constructed before setup()
 // =============================================================================
-RTC_DATA_ATTR static uint8_t _partialCount = 0;
+RTC_DATA_ATTR static uint16_t _partialCount = 0;
+// Save render inputs (about 640 bytes), not the 12.5KB framebuffer. Rebuild
+// the panel's previous image after reset/hibernate for differential refresh.
+RTC_DATA_ATTR static DisplaySnapshot _previous;
+RTC_DATA_ATTR static bool _previousValid = false;
+static bool _displayInitialized = false;
+static_assert(DISPLAY_FULL_REFRESH_EVERY > 0 && DISPLAY_FULL_REFRESH_EVERY <= 65535,
+              "Invalid full-refresh interval");
 
 static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> _display(
     GxEPD2_370_GDEY037T03(EPD_CS, EPD_DC, EPD_RES, EPD_BUSY)
@@ -91,7 +98,7 @@ static void drawRowLabel(const char *lbl, int16_t rowCY) {
 // Draw a sparkline for one row from a typed circular history buffer.
 // outMn / outMx receive the data min/max (needed for CO2 threshold line).
 template<typename T>
-static void drawSparkRow(T *hist, uint8_t count, uint8_t head, uint8_t histLen,
+static void drawSparkRow(const T *hist, uint8_t count, uint8_t head, uint8_t histLen,
                           float scale, int16_t rowCY,
                           float &outMn, float &outMx) {
     outMn = 0.0f;
@@ -226,8 +233,9 @@ static void drawZone2(float co2, bool readOk) {
 // Zone 3 — Sparkline strip  (T / H / C rows)
 // y = Z3_TOP .. Z4_TOP  (~158px)
 // =============================================================================
-static void drawZone3(uint16_t *co2Hist, int16_t *tempHist, uint8_t *humHist,
-                       uint8_t count, uint8_t head, uint8_t histLen) {
+static void drawZone3(const HistoryBuffer &history) {
+    const uint8_t count = history.count, head = history.head;
+    const uint8_t histLen = HistoryBuffer::capacity;
     // Row labels
     drawRowLabel("T", T_CY);
     drawRowLabel("H", H_CY);
@@ -235,9 +243,9 @@ static void drawZone3(uint16_t *co2Hist, int16_t *tempHist, uint8_t *humHist,
 
     // Sparklines — tempHistory is °F×10, scale 0.1 gives °F directly
     float tMn, tMx, hMn, hMx, cMn, cMx;
-    drawSparkRow(tempHist, count, head, histLen, 0.1f, T_CY, tMn, tMx);
-    drawSparkRow(humHist,  count, head, histLen, 1.0f, H_CY, hMn, hMx);
-    drawSparkRow(co2Hist,  count, head, histLen, 1.0f, C_CY, cMn, cMx);
+    drawSparkRow(history.temperatureF10, count, head, histLen, 0.1f, T_CY, tMn, tMx);
+    drawSparkRow(history.humidityPercent,  count, head, histLen, 1.0f, H_CY, hMn, hMx);
+    drawSparkRow(history.co2Ppm,  count, head, histLen, 1.0f, C_CY, cMn, cMx);
 
     // CO2 threshold dashed line (on C row only, if in visible range)
     if (count >= 2 && (float)CO2_ALERT_PPM >= cMn && (float)CO2_ALERT_PPM <= cMx) {
@@ -317,8 +325,20 @@ static void drawZone4(float battV, float battPct, bool battOk,
 // Public API
 // =============================================================================
 
+// Both the old image plane and the new visible frame use exactly this renderer.
+static void drawFrame(const DisplaySnapshot &snapshot) {
+    const auto &environment = snapshot.readings.environment;
+    const auto &battery = snapshot.readings.battery;
+    _display.fillScreen(GxEPD_WHITE);
+    drawZone1(environment.temperatureC, environment.humidityPercent, environment.valid);
+    drawZone2(environment.co2Ppm, environment.valid);
+    drawZone3(snapshot.history);
+    drawZone4(battery.voltageV, battery.chargePercent, battery.voltageV > 0, snapshot.uptimeS);
+}
+
 void initDisplay() {
-    _display.init(0, true, 10, false);  // no serial diag, hard reset, 10ms pulse
+    _display.init(0, false, 10, false); // We explicitly seed both image planes.
+    _displayInitialized = true;
     _display.setRotation(0);            // portrait
     _display.setTextWrap(false);
     _u8g2.begin(_display);
@@ -328,20 +348,18 @@ void initDisplay() {
 
 void resetDisplayRefreshCount() {
     _partialCount = 0;
+    _previousValid = false;
 }
 
-void updateDisplay(float co2, float temperature, float humidity,
-                   float battV, float battPct, bool readOk,
-                   uint32_t totalUptimeS,
-                   uint16_t *co2Hist,
-                   int16_t  *tempHist,
-                   uint8_t  *humHist,
-                   uint8_t   histCount,
-                   uint8_t   histHead) {
-    const uint8_t HIST_LEN = 120;
-    bool battOk = (battV > 0.0f);
-
-    bool doFull = (_partialCount % DISPLAY_FULL_REFRESH_EVERY == 0);
+void updateDisplay(const DisplaySnapshot &snapshot) {
+    bool doFull = !_previousValid || _partialCount == 0;
+    if (!doFull) {
+        _display.setFullWindow();
+        _display.firstPage();
+        do {
+            drawFrame(_previous);
+        } while (_display.nextPageToPrevious());
+    }
     LOG("[DSP] %s refresh (count=%u)\n", doFull ? "Full" : "Partial", _partialCount);
     if (doFull) {
         _display.setFullWindow();
@@ -349,20 +367,18 @@ void updateDisplay(float co2, float temperature, float humidity,
         _display.setPartialWindow(0, 0, GxEPD2_370_GDEY037T03::WIDTH,
                                         GxEPD2_370_GDEY037T03::HEIGHT);
     }
-    _partialCount++;
+    _partialCount = (_partialCount + 1) % DISPLAY_FULL_REFRESH_EVERY;
 
     _display.firstPage();
     do {
-        _display.fillScreen(GxEPD_WHITE);
-        drawZone1(temperature, humidity, readOk);
-        drawZone2(co2, readOk);
-        drawZone3(co2Hist, tempHist, humHist, histCount, histHead, HIST_LEN);
-        drawZone4(battV, battPct, battOk, totalUptimeS);
+        drawFrame(snapshot);
     } while (_display.nextPage());
 
+    _previous = snapshot;
+    _previousValid = true;
     LOG("[DSP] Display updated.\n");
 }
 
 void hibernateDisplay() {
-    _display.hibernate();
+    if (_displayInitialized) _display.hibernate();
 }

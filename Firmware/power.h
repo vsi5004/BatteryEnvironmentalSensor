@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "readings.h"
 
 // Initialise power rails: pull NeoPixel power LOW immediately, enable I2C rail.
 void initPower();
@@ -16,8 +17,8 @@ void disableSensors();
 bool initBattery();
 
 // Read battery voltage (V) and state-of-charge (%).
-// Returns false if the fuel gauge is unavailable.
-bool readBattery(float &voltage, float &percent);
+// Returns zero values if the fuel gauge is unavailable.
+BatteryReadings readBattery();
 
 // Full shutdown sequence, then enter deep sleep for SLEEP_DURATION_S seconds.
 // Never returns.

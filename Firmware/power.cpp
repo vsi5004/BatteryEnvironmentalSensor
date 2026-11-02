@@ -48,11 +48,13 @@ bool initBattery() {
     return true;
 }
 
-bool readBattery(float &voltage, float &percent) {
-    if (!_batteryOk) return false;
-    voltage = _maxlipo.cellVoltage();
-    percent = _maxlipo.cellPercent();
-    return true;
+BatteryReadings readBattery() {
+    BatteryReadings result{};
+    if (_batteryOk) {
+        result.voltageV = _maxlipo.cellVoltage();
+        result.chargePercent = _maxlipo.cellPercent();
+    }
+    return result;
 }
 
 void enterDeepSleep() {

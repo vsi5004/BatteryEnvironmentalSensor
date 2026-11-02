@@ -106,62 +106,48 @@ Copy `config.example.h` to `config.h` (gitignored) and fill in your values:
 
 ## Firmware Architecture
 
-### Wake Cycle
+### Wake cycle
 
-All logic runs inside `setup()`. `loop()` is empty. Each wake cycle:
+`Firmware.ino` coordinates one wake cycle; `loop()` is empty. The order is intentional:
 
-```
-Power-on / wake from deep sleep
-  → Wire.begin()
-  → initPower()           — NeoPixel OFF, STEMMA QT rail ON
-  → initSensors()         — SHT40 init; 35ms SCD41 power-up delay; warmup shot triggered
-  → initBattery()         — MAX17048 quickStart + 125ms settle  ← overlaps warmup window
-  → readBattery()
-  → triggerMeasurement()  — waits for warmup shot, discards it, fires real shot
-  → connectWifi()         — real shot runs during WiFi connect (~3–5s overlap)
-  → readSensors()         — polls for real shot result, reads both sensors
-  → appendHistory()       — push to RTC circular buffers
-  → publishDiscovery()    — first boot only (RTC flag)
-  → publishMQTT()
-  → disconnectWifi()      — graceful MQTT disconnect before radio off
-  → totalUptimeS += SLEEP_DURATION_S
-  → initDisplay() + updateDisplay()  — only if interval elapsed
-  → enterDeepSleep()
-```
+1. Initialize elapsed uptime, I2C and power rails.
+2. Start the SCD41 warmup; initialize/read the battery while it converts.
+3. Drain the warmup and start the real conversion.
+4. Connect Wi-Fi while that conversion runs, then read the result.
+5. Append valid readings to history and publish Home Assistant messages.
+6. Disconnect Wi-Fi, refresh the display if due, then enter deep sleep.
 
-### RTC Memory
+`logReadings()`, `publishReadings()` and `refreshDisplayIfDue()` keep details out of the coordinator. Do not combine the sensor phases into a blocking read followed by Wi-Fi: that would lose the overlap and waste awake time.
 
-State that persists across deep sleep (lost on power-off):
+### Data and ownership
 
-```cpp
-RTC_DATA_ATTR uint32_t lastDisplayUpdateS;
-RTC_DATA_ATTR uint32_t totalUptimeS;
+- `EnvironmentalReadings`, `BatteryReadings` and `SensorReadings` are value objects with units in their field names. Sensor/power functions return them; publishing and display functions consume them.
+- `HistoryBuffer` owns fixed arrays, count/head, validity filtering and unit conversion. It has no heap allocation, pointers or runtime initialization.
+- `RetainedState` in the sketch groups history, the last-display timestamp and discovery status. Hardware objects remain separate and are recreated on each wake.
+- `DisplaySnapshot` groups the readings, history and elapsed time for one frame. Both previous-image restoration and current-image drawing call the same `drawFrame()` renderer.
+- `uptime.cpp` owns the retained clock origin. ON time includes awake work and deep sleep; non-deep-sleep resets restart it. Displayed time changes only on refresh. RTC oscillator drift remains. Adding SNTP or `settimeofday()` requires adjusting the origin too.
 
-RTC_DATA_ATTR uint16_t co2History[120];   // raw ppm
-RTC_DATA_ATTR int16_t  tempHistory[120];  // °F × 10  (e.g. 724 = 72.4°F)
-RTC_DATA_ATTR uint8_t  humHistory[120];   // 0–100 %RH
-RTC_DATA_ATTR uint8_t  historyCount;
-RTC_DATA_ATTR uint8_t  historyHead;
-RTC_DATA_ATTR bool     discoveryPublished;
-// (display.cpp) RTC_DATA_ATTR static uint8_t _partialCount; — partial refresh counter
-```
+History and display snapshots are compile-time checked as trivially copyable so they remain suitable for RTC memory. No inheritance hierarchy is needed for these data types. The only adapter subclass is `BudgetWiFiClient`, required by PubSubClient's client API.
 
-120 samples at one per cycle (~155s) covers approximately 5 hours of history.
+### File responsibilities
 
-### File Structure
+| File | Responsibility |
+| --- | --- |
+| `Firmware.ino` | Wake orchestration and retained application state |
+| `readings.h` | Named reading values and units |
+| `history.h` | Fixed circular history storage and append logic |
+| `uptime.h/.cpp` | RTC-backed elapsed time |
+| `sensors.h/.cpp` | SHT40/SCD41 initialization and measurement phases |
+| `power.h/.cpp` | Power rails, battery gauge and shutdown |
+| `network.h/.cpp` | Wi-Fi lifecycle and shared MQTT connection policy |
+| `mqtt_transport.h` | Deadline-aware WiFiClient adapter |
+| `mqtt_ha.h/.cpp` | Home Assistant discovery and state JSON |
+| `display.h/.cpp` | Snapshots, rendering and refresh policy |
+| `config.h` | Private credentials and tuning; unchanged by refactoring |
+| `debug.h` | Logging helpers; includes its own configuration dependency |
+| `tests/` | Host regressions generated from production code |
 
-```
-envsensor/
-├── envsensor.ino        — main sketch, RTC vars, wake cycle orchestration
-├── config.example.h     — configuration template (copy to config.h and fill in)
-├── config.h             — credentials and tuning (gitignored)
-├── debug.h              — LOG() / LOG_FLUSH() inline template helpers
-├── power.h / .cpp       — power rail control, MAX17048, deep sleep entry
-├── sensors.h / .cpp     — SHT40 + SCD41 init and read
-├── mqtt_ha.h / .cpp     — WiFi, MQTT publish, HA auto-discovery
-├── display.h / .cpp     — GxEPD2 layout, sparklines, battery icon
-└── .gitignore
-```
+120 samples span roughly 5.5 hours at a 155-second sleep plus a 10-second awake cycle; network delays and failed samples change that span.
 
 ---
 
@@ -172,12 +158,12 @@ envsensor/
 The SCD41 datasheet recommends discarding the first single-shot measurement after a cold start. This is implemented with a two-shot pattern:
 
 1. `initSensors()`: wait 35ms after power-on (datasheet max: 30ms), then fire a **warmup shot**. This shot is discarded per the Sensirion datasheet recommendation.
-2. Other init (battery gauge etc.) runs during the ~3.8s warmup window.
+2. Other init (battery gauge etc.) runs during the 5s warmup window.
 3. `triggerMeasurement()`: waits for the warmup shot to complete, discards it, fires the **real shot**.
 4. WiFi connects during the ~5s real shot window.
-5. `readSensors()`: polls for the real shot result (starts polling at 3.8s, timeout at 5.1s) then reads both sensors.
+5. `readSensors()`: polls for the real shot result (starts polling at 5s, timeout at 5.1s) then reads both sensors.
 
-Total extra cost: near zero — the warmup delay is hidden behind WiFi connect time.
+Battery setup overlaps the warmup; Wi-Fi connects during the real conversion. The two conversions require about 10 seconds total.
 
 ### SHT40 — Primary T/H Source
 
@@ -276,3 +262,28 @@ All entities are grouped under a single HA device block. To force re-discovery, 
 | MQTT discovery drops last entity | TCP send buffer not flushed before WiFi off | `_mqtt.disconnect()` + 100ms before `WiFi.disconnect()` |
 | Mosquitto receives null retained messages | HA clears retained topics when a device is deleted | Don't delete HA device; power-cycle ESP32 to republish |
 | Display blank after first flash | `DISPLAY_UPDATE_INTERVAL` (300s) > `SLEEP_DURATION_S` (155s); first cycle elapsed time fell short | Fixed — hard reset now forces an immediate update regardless of interval |
+
+
+## Timing and power fixes (November 2026)
+
+- SCD41 single-shot commands are sent directly over Wire (0x219d). The installed Sensirion library 1.1.0 blocks for 5000 ms in `measureSingleShot()`, so it must not be used as an asynchronous trigger. Battery initialization overlaps the warmup; Wi-Fi overlaps the real shot. Readiness polling begins at 5000 ms and ends at 5100 ms from command dispatch. Late callers check once without starting another wait window.
+- Wi-Fi station mode starts before setting TX power. A failed connection turns the radio off immediately.
+- MQTT has one shared attempt/budget per wake, including discovery and state publication. TCP connect uses the remaining budget; nonblocking socket writes and a deadline-aware availability check also bound stalled/fragmented replies. `MQTT_BROKER` must be a numeric IP address, avoiding an independent blocking DNS lookup. Discovery is marked complete only when all messages were accepted for publication (QoS 0 does not confirm broker delivery).
+- Display initialization disables the library's implicit first-refresh behavior. Full refreshes explicitly seed both image planes. Partial refreshes reconstruct the previous image from retained render inputs before writing the new image, so controller RAM need not survive hibernation. The saved snapshot uses roughly 640 bytes of RTC RAM. Full-refresh cadence uses a bounded counter rather than overflowing at 256 updates. No display commands run on wakes that did not initialize the display.
+- ON time uses elapsed RTC-backed system time, including awake work. No network time synchronization is enabled.
+
+### Regression checks
+
+`tests/generate_regression.py` extracts the production timing, network budget and display functions into a host test with fake hardware, using the real reading/history types. `tests/generate_wake_test.py` exercises the production sketch against fake hardware to verify phase ordering, display cadence, sensor/Wi-Fi failure paths and discovery retries. `tests/generate_uptime_test.py` checks RTC-backed uptime through sleep and reset. Run each generator from a scratch/build directory, compile its generated `regression.cpp`, `wake_test.cpp` or `uptime_test.cpp` with a C++11-or-newer compiler, then run the executable. The tests cover delayed sensor reads, failed commands, millisecond wraparound, blocked socket writes, history wraparound, previous-image reconstruction, 300 display updates, resets and skipped display shutdown.
+
+A successful firmware build validates compilation/linking, not display ghosting or measured battery life. Verify partial refreshes and wake current on hardware before treating power savings as measured.
+
+### Verified build and hardware
+
+Built November 2, 2026 in local Docker with Arduino CLI 1.3.1, Arduino-ESP32 3.3.8 and the real configuration: 1,110,619 bytes flash (38%), 89,232 bytes RAM (27%). All three host regression suites passed. The Linux toolchain avoids the Windows compiler DLL loading error.
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32s3 --jobs 2 --build-path /build/compiled /build/Firmware
+```
+
+USB flashing passed hash verification. Sensor readings, MQTT publication and display updates were confirmed on the board. After flashing from download mode, tap RESET without holding BOOT if the firmware does not start. Battery lifetime and long-term display ghosting remain unmeasured.

@@ -21,7 +21,7 @@
 // =============================================================================
 // MQTT / Home Assistant
 // =============================================================================
-#define MQTT_BROKER     "192.168.1.x"   // IP of your MQTT broker
+#define MQTT_BROKER     "192.168.1.x"   // Numeric IP required (bounded connection; no DNS)
 #define MQTT_PORT       1883
 #define MQTT_USER       ""              // leave empty if no auth
 #define MQTT_PASS       ""

@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "config.h"
 
 // At DEBUG=0 these are empty inline functions — the compiler eliminates all
 // call sites, arguments, and format strings from the binary entirely.

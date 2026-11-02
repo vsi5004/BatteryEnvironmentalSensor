@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Arduino.h>
+#include "readings.h"
 
 // Initialise SHT40 and SCD41, apply temperature offset, and fire the SCD41
 // warmup single-shot (to be discarded per datasheet). Call this as early as
@@ -14,12 +14,6 @@ bool initSensors();
 // Returns true if the real shot was successfully triggered.
 bool triggerMeasurement();
 
-// Wait for the real measurement result and read both sensors.
-//   co2         — CO2 in ppm (from SCD41)
-//   temperature — temperature in °C (from SHT40, authoritative)
-//   humidity    — relative humidity in % (from SHT40, authoritative)
-//   ok          — set to false if any sensor failed; individual fields will be 0
-//
-// Must be called after triggerMeasurement(). Blocks until the SCD41 result
-// is ready (typically within a few ms if WiFi connection took ~5s).
-void readSensors(float &co2, float &temperature, float &humidity, bool &ok);
+// Finish the real measurement after Wi-Fi has had a chance to connect.
+// Returns a value object; valid is false if either sensor failed.
+EnvironmentalReadings readSensors();

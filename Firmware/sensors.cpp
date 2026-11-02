@@ -13,9 +13,19 @@ static uint32_t _warmupTriggerMs  = 0;
 static uint32_t _realShotTriggerMs = 0;
 
 // Datasheet max command duration for measure_single_shot is 5000ms.
-// We start polling for data ready at 3800ms and bail out at 5100ms.
-static const uint32_t SCD41_POLL_START_MS   = 3800;
+// Allow the specified command duration before querying readiness.
+static const uint32_t SCD41_POLL_START_MS   = 5000;
 static const uint32_t SCD41_POLL_TIMEOUT_MS = 5100;
+
+// The library's measureSingleShot() includes delay(5000). Send its command
+// directly so battery setup / WiFi can overlap the sensor's conversion.
+static bool startSingleShot(uint32_t &triggerMs) {
+    triggerMs = millis();
+    Wire.beginTransmission(0x62);
+    Wire.write(0x21);
+    Wire.write(0x9d);
+    return Wire.endTransmission() == 0;
+}
 
 // Wait for data ready starting from a given trigger timestamp.
 // Returns true if data is ready, false on timeout or I2C error.
@@ -26,12 +36,15 @@ static bool waitForDataReady(uint32_t triggerMs) {
 
     bool dataReady = false;
     uint16_t err = 0;
-    uint32_t pollStart = millis();
-    while (millis() - pollStart < (SCD41_POLL_TIMEOUT_MS - SCD41_POLL_START_MS)) {
+    // Always check once, even if WiFi took longer than the conversion.
+    // An overdue conversion gets no new polling window.
+    do {
         err = _scd41.getDataReadyStatus(dataReady);
         if (err != 0 || dataReady) break;
-        delay(10);
-    }
+        uint32_t elapsedMs = millis() - triggerMs;
+        if (elapsedMs >= SCD41_POLL_TIMEOUT_MS) break;
+        delay(min((uint32_t)10, SCD41_POLL_TIMEOUT_MS - elapsedMs));
+    } while (true);
     if (err != 0 || !dataReady) {
         Serial.printf("[SEN] SCD41 data not ready (err=%u, ready=%d)\n", err, dataReady);
         return false;
@@ -89,17 +102,15 @@ bool initSensors() {
     }
 
     // Trigger a warmup shot immediately. The first single-shot after power-on
-    // should be discarded per datasheet — firing it now lets it run while the
-    // real shot triggers, so it doesn't add net awake time.
-    uint16_t err = _scd41.measureSingleShot();
-    if (err != 0) {
-        Serial.printf("[SEN] SCD41 warmup shot error: %u\n", err);
+    // should be discarded per datasheet. Battery setup overlaps this shot;
+    // the second shot cannot start until the warmup has completed.
+    if (!startSingleShot(_warmupTriggerMs)) {
+        LOG("[SEN] SCD41 warmup shot command failed\n");
         ok = false;
     } else {
         LOG("[SEN] SCD41 warmup shot triggered\n");
     }
 
-    _warmupTriggerMs = millis();
     return ok;
 }
 
@@ -110,28 +121,24 @@ bool triggerMeasurement() {
         return false;
     }
     uint16_t dummy = 0; float dummyT = 0.0f, dummyH = 0.0f;
-    _scd41.readMeasurement(dummy, dummyT, dummyH);  // discard
+    if (_scd41.readMeasurement(dummy, dummyT, dummyH) != 0) return false;
 
     // Trigger the real measurement. WiFi will connect during this window.
-    uint16_t err = _scd41.measureSingleShot();
-    if (err != 0) {
-        Serial.printf("[SEN] SCD41 real shot error: %u\n", err);
+    if (!startSingleShot(_realShotTriggerMs)) {
+        LOG("[SEN] SCD41 real shot command failed\n");
         return false;
     }
     LOG("[SEN] SCD41 real shot triggered\n");
-    _realShotTriggerMs = millis();
     return true;
 }
 
-void readSensors(float &co2, float &temperature, float &humidity, bool &ok) {
-    co2 = 0.0f;
-    temperature = 0.0f;
-    humidity = 0.0f;
-    ok = true;
+EnvironmentalReadings readSensors() {
+    EnvironmentalReadings result{};
+    result.valid = true;
 
     if (!waitForDataReady(_realShotTriggerMs)) {
-        ok = false;
-        return;
+        result.valid = false;
+        return result;
     }
     LOG("[SEN] SCD41 ready after %lu ms\n", millis() - _realShotTriggerMs);
 
@@ -139,11 +146,11 @@ void readSensors(float &co2, float &temperature, float &humidity, bool &ok) {
     sensors_event_t hum_event, temp_event;
     if (!_sht40.getEvent(&hum_event, &temp_event)) {
         Serial.println("[SEN] SHT40 read failed");
-        ok = false;
+        result.valid = false;
     } else {
-        temperature = temp_event.temperature;
-        humidity    = hum_event.relative_humidity;
-        LOG("[SEN] SHT40: T=%.2f°C  H=%.2f%%\n", temperature, humidity);
+        result.temperatureC = temp_event.temperature;
+        result.humidityPercent    = hum_event.relative_humidity;
+        LOG("[SEN] SHT40: T=%.2f°C  H=%.2f%%\n", result.temperatureC, result.humidityPercent);
     }
 
     // --- SCD41: read real measurement result --------------------------------
@@ -153,9 +160,10 @@ void readSensors(float &co2, float &temperature, float &humidity, bool &ok) {
     uint16_t err = _scd41.readMeasurement(co2Raw, scd41T, scd41H);
     if (err != 0) {
         Serial.printf("[SEN] SCD41 readMeasurement error: %u\n", err);
-        ok = false;
+        result.valid = false;
     } else {
-        co2 = (float)co2Raw;
+        result.co2Ppm = (float)co2Raw;
         LOG("[SEN] SCD41: CO2=%u ppm  T=%.2f°C  H=%.2f%%\n", co2Raw, scd41T, scd41H);
     }
+    return result;
 }
